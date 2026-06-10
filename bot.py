@@ -27,7 +27,11 @@ bot = MyBot()
 guild_config = {}
 
 # Dictionary to keep track of active temporary channels and their owners
+# { channel_id: owner_id }
 active_channels = {}
+
+# Track one channel per user: { guild_id: { user_id: channel_id } }
+user_active_channel = {}
 
 @bot.event
 async def on_ready():
@@ -41,9 +45,32 @@ async def on_voice_state_update(member, before, after):
     # Case 1: Member joins the designated Hub Channel
     if after.channel and config and after.channel.id == config.get("hub"):
         guild = member.guild
-        category = guild.get_channel(config.get("category"))
+        guild_user_map = user_active_channel.setdefault(guild.id, {})
 
+        # --- ONE CHANNEL PER USER ENFORCEMENT ---
+        if member.id in guild_user_map:
+            existing_channel_id = guild_user_map[member.id]
+            existing_channel = guild.get_channel(existing_channel_id)
+            if existing_channel:
+                # Move them to their existing channel instead
+                await member.move_to(existing_channel)
+                try:
+                    embed = discord.Embed(
+                        title="⚠️ You Already Have a Channel!",
+                        description=f"You already own {existing_channel.mention}. You've been moved back to it.",
+                        color=discord.Color.orange()
+                    )
+                    await existing_channel.send(embed=embed, delete_after=10)
+                except Exception:
+                    pass
+                return
+            else:
+                # Channel no longer exists, clean up stale entry
+                del guild_user_map[member.id]
+
+        category = guild.get_channel(config.get("category"))
         channel_name = f"🔊 {member.display_name}'s Lounge"
+
         new_channel = await guild.create_voice_channel(
             name=channel_name,
             category=category,
@@ -51,6 +78,8 @@ async def on_voice_state_update(member, before, after):
         )
 
         active_channels[new_channel.id] = member.id
+        guild_user_map[member.id] = new_channel.id
+
         await member.move_to(new_channel)
 
         embed = discord.Embed(
@@ -63,9 +92,10 @@ async def on_voice_state_update(member, before, after):
             value=(
                 "`/vc lock` - Lock the channel.\n"
                 "`/vc unlock` - Open the channel back up.\n"
-                "`/limit <number>` - Change the max player slot.\n"
-                "`/vc kick @user` - Kick a user out once.\n"
-                "`/vc ban @user` - Ban a user from your channel."
+                "`/vc kick @user` - Kick a user out.\n"
+                "`/vc ban @user` - Ban a user from your channel.\n"
+                "`/vc unban @user` - Unban a user from your channel.\n"
+                "`/limit <number>` - Change the max player slot."
             ),
             inline=False
         )
@@ -77,9 +107,14 @@ async def on_voice_state_update(member, before, after):
         vc = before.channel
         if len(vc.members) == 0:
             try:
-                del active_channels[vc.id]
+                owner_id = active_channels.pop(vc.id, None)
                 await vc.delete(reason="Temporary dynamic voice channel empty.")
-            except KeyError:
+
+                # Clean up user_active_channel map
+                guild_map = user_active_channel.get(vc.guild.id, {})
+                if owner_id and guild_map.get(owner_id) == vc.id:
+                    del guild_map[owner_id]
+            except Exception:
                 pass
 
 # --- CUSTOM CHECK FOR VC OWNER ---
@@ -187,7 +222,6 @@ class VcGroup(app_commands.Group):
             return await interaction.response.send_message(f"❌ {user.mention} is not in your VC.", ephemeral=True)
         if user.id == interaction.user.id:
             return await interaction.response.send_message("❌ You cannot kick yourself!", ephemeral=True)
-
         await user.move_to(None)
         embed = discord.Embed(title="👟 User Disconnected", description=f"{user.mention} has been kicked from the VC.", color=discord.Color.orange())
         await interaction.response.send_message(embed=embed)
@@ -200,11 +234,34 @@ class VcGroup(app_commands.Group):
         vc = interaction.channel
         if user.id == interaction.user.id:
             return await interaction.response.send_message("❌ You cannot ban yourself!", ephemeral=True)
-
         await vc.set_permissions(user, connect=False)
         if user in vc.members:
             await user.move_to(None)
         embed = discord.Embed(title="🚫 User Banned from VC", description=f"{user.mention} has been banned and kicked.", color=discord.Color.red())
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="unban", description="Unban a user from your channel.")
+    @app_commands.describe(user="The user to unban")
+    async def unban(self, interaction: discord.Interaction, user: discord.Member):
+        if not await is_vc_owner_check(interaction):
+            return
+        vc = interaction.channel
+
+        # Check if user actually has a permission overwrite on this channel
+        overwrite = vc.overwrites_for(user)
+        if overwrite.connect is not False:
+            return await interaction.response.send_message(
+                f"❌ {user.mention} isn't banned from this channel.",
+                ephemeral=True
+            )
+
+        # Remove the connect=False overwrite entirely
+        await vc.set_permissions(user, overwrite=None)
+        embed = discord.Embed(
+            title="✅ User Unbanned",
+            description=f"{user.mention} can now rejoin the channel.",
+            color=discord.Color.green()
+        )
         await interaction.response.send_message(embed=embed)
 
 bot.tree.add_command(VcGroup())
@@ -216,14 +273,11 @@ bot.tree.add_command(VcGroup())
 async def limit_vc(interaction: discord.Interaction, number: int):
     if not await is_vc_owner_check(interaction):
         return
-
     if number < 0 or number > 99:
         embed = discord.Embed(description="❌ Limit must be between `0` and `99`.", color=discord.Color.red())
         return await interaction.response.send_message(embed=embed, ephemeral=True)
-
     vc = interaction.channel
     await vc.edit(user_limit=number)
-
     status = f"set to **{number}** users" if number > 0 else "**removed** (Unlimited)"
     embed = discord.Embed(title="👥 User Limit Updated", description=f"The player limit has been {status}.", color=discord.Color.blue())
     await interaction.response.send_message(embed=embed)
